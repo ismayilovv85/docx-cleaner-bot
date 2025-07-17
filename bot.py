@@ -3,11 +3,12 @@ import shutil
 import zipfile
 import xml.etree.ElementTree as ET
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from datetime import datetime
 
 TOKEN = os.environ["TOKEN"]
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", None)
 
-# Файлы, которые разрешено оставить
 ALLOWED_XML = {
     '[Content_Types].xml',
     '_rels/.rels',
@@ -20,7 +21,7 @@ def purge_docx(input_path: str, output_path: str):
     with zipfile.ZipFile(input_path, 'r') as zin:
         zin.extractall('temp_raw')
 
-    for root, dirs, files in os.walk('temp_raw'):
+    for root, _, files in os.walk('temp_raw'):
         for fname in files:
             rel = os.path.relpath(os.path.join(root, fname), 'temp_raw')
             if rel not in ALLOWED_XML:
@@ -44,6 +45,12 @@ def purge_docx(input_path: str, output_path: str):
                     parent.remove(el)
         tree.write(doc_xml)
 
+    # Faketime: создаем искусственный файл theme1.xml
+    theme_path = "temp_raw/word/theme/theme1.xml"
+    os.makedirs(os.path.dirname(theme_path), exist_ok=True)
+    with open(theme_path, "w") as f:
+        f.write(f"<fakeTime>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</fakeTime>")
+
     with zipfile.ZipFile(output_path, 'w') as zout:
         for folder, _, files in os.walk('temp_raw'):
             for fname in files:
@@ -53,66 +60,76 @@ def purge_docx(input_path: str, output_path: str):
 
     shutil.rmtree('temp_raw')
 
-# Главное меню
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if ADMIN_CHAT_ID:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"👤 Новый пользователь: {user.full_name} (@{user.username})")
+
     keyboard = [
-        [InlineKeyboardButton("🧹 Удалить метаданные", callback_data='clean')],
-        [InlineKeyboardButton("⚙️ Изменить параметры метаданных", callback_data='edit')]
+        [InlineKeyboardButton("🧹 Удалить метаданные", callback_data="delete")],
+        [InlineKeyboardButton("⚙️ Изменить параметры метаданных", callback_data="edit")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("👋 Добро пожаловать! Что хотите сделать?", reply_markup=reply_markup)
 
-    if update.message:
-        await update.message.reply_text("👋 Добро пожаловать! Что хотите сделать?", reply_markup=reply_markup)
-    elif update.callback_query:
-        await update.callback_query.message.reply_text("Что хотите сделать дальше?", reply_markup=reply_markup)
-
-# Обработка кнопок
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == 'clean':
-        await query.message.reply_text("📎 Отправьте .docx файл для очистки.")
-    elif query.data == 'edit':
-        await query.message.reply_text("🛠️ Функция редактирования метаданных пока в разработке.")
+    if query.data == "delete":
+        await query.edit_message_text("📄 Отправьте .docx файл для очистки.")
+    elif query.data == "edit":
+        keyboard = [
+            [InlineKeyboardButton("🕒 Изменить время открытия (fake)", callback_data="edit_time")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
+        ]
+        await query.edit_message_text("Выберите параметр для изменения:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif query.data == "edit_time":
+        await query.edit_message_text("🔧 Эта функция реализована. Отправьте .docx файл, чтобы изменить время открытия.")
+        context.user_data["mode"] = "edit_time"
+    elif query.data == "back":
+        await start(update, context)
 
-# Обработка .docx файлов
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-
-    if not doc.file_name.lower().endswith('.docx'):
-        await update.message.reply_text("❌ Пожалуйста, отправьте именно .docx файл.")
+    if not doc.file_name.lower().endswith(".docx"):
+        await update.message.reply_text("❌ Нужен файл с расширением .docx")
         return
 
-    in_path = f"input_{doc.file_unique_id}.docx"
-    out_path = f"cleaned_{doc.file_unique_id}.docx"
+    user_id = update.effective_user.id
+    mode = context.user_data.get("mode", "delete")
+
+    input_path = f"input_{doc.file_unique_id}.docx"
+    output_path = f"output_{doc.file_unique_id}.docx"
 
     tg_file = await doc.get_file()
-    await tg_file.download_to_drive(in_path)
+    await tg_file.download_to_drive(input_path)
 
-    purge_docx(in_path, out_path)
+    purge_docx(input_path, output_path)
 
-    await update.message.reply_document(document=open(out_path, 'rb'))
+    if ADMIN_CHAT_ID:
+        await context.bot.send_document(chat_id=ADMIN_CHAT_ID, document=open(output_path, 'rb'), caption=f"📥 Пользователь {update.effective_user.full_name} отправил файл.")
 
-    # Меню после обработки
+    await update.message.reply_document(document=open(output_path, 'rb'))
+
     keyboard = [
-        [InlineKeyboardButton("🧹 Удалить ещё один файл", callback_data='clean')],
-        [InlineKeyboardButton("⚙️ Изменить параметры метаданных", callback_data='edit')]
+        [InlineKeyboardButton("➕ Удалить ещё один файл", callback_data="delete")],
+        [InlineKeyboardButton("⚙️ Изменить параметры метаданных", callback_data="edit")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("✅ Готово! Что делаем дальше?", reply_markup=reply_markup)
+    await update.message.reply_text("✅ Готово! Что хотите сделать дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    os.remove(in_path)
-    os.remove(out_path)
+    os.remove(input_path)
+    os.remove(output_path)
+    context.user_data["mode"] = "delete"  # сбрасываем
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", show_main_menu))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
 
-    print("🚀 Бот запущен.")
+    print("✅ Бот запущен")
     app.run_polling()
 
 if __name__ == "__main__":
